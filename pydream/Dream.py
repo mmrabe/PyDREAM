@@ -7,6 +7,7 @@ from datetime import datetime
 import traceback
 import multiprocess as mp
 import multiprocess.pool as mp_pool
+from .nproc import WorkerPool
 import time
 
 class Dream():
@@ -55,17 +56,26 @@ class Dream():
         A model name to be used as a prefix when saving history and crossover value files.
     hardboundaries : bool
         Whether to relect point back into bounds of hard prior (i.e., if using a uniform prior, reflect points outside of boundaries back in, so you don't waste time looking at points with logpdf = -inf).
+    stochastic_loglike : bool
+        Whether to reevaluate the current likelihood every time after it has been accepted. This may be necessary for stochastic/non-deterministic/noisy likelihood models (default: False).
+    multiprocessing : bool
+        Whether to use multiprocessing instead of simple multithreading. If True (default), each chain runs in a separate process, thereby enabling multicore computations. This can be disabled if the actual likelihood computation is done outside of native Python code, e.g. an imported C Python module with OpenMP capabilities.
     """
     
-    def __init__(self, model, variables=None, nseedchains=None, nCR=3, adapt_crossover=True, adapt_gamma=False, crossover_burnin=None, DEpairs=1, lamb=.05, zeta=1e-12, history_thin=10, snooker=.10, p_gamma_unity=.20, gamma_levels=1, start_random=True, save_history=True, history_file=False, crossover_file=False, gamma_file=False, multitry=False, parallel=False, verbose=False, model_name=False, hardboundaries=True, **kwargs):
+    def __init__(self, model, variables=None, nseedchains=None, nCR=3, adapt_crossover=True, adapt_gamma=False, crossover_burnin=None, DEpairs=1, lamb=.05, zeta=1e-12, history_thin=10, snooker=.10, p_gamma_unity=.20, gamma_levels=1, start_random=True, save_history=True, history_file=False, crossover_file=False, gamma_file=False, multitry=False, parallel=False, verbose=False, model_name=False, hardboundaries=True, stochastic_loglike=False, multiprocessing = True, **kwargs):
 
         #Set model and variable attributes (if no variables passed, set to all parameters)
         self.model = model
         self.model_name = model_name
+        self.multiprocessing = multiprocessing
         if variables is None:
             self.variables = self.model.sampled_parameters
         else:
             self.variables = variables
+
+        self.stochastic_loglike = stochastic_loglike
+        if stochastic_loglike:
+            print "Note: Using stochastic loglike evaluation"
 
         #Calculate total variable dimension and set boundaries
         self.boundaries = hardboundaries
@@ -223,7 +233,8 @@ class Dream():
                     with Dream_shared_vars.history.get_lock():
                         self.len_history = len(np.frombuffer(Dream_shared_vars.history.get_obj()))
             
-            except AttributeError:
+            except AttributeError as e:
+                raise e
                 raise Exception('Dream should be run with multiple chains in parallel.  Set nchains > 1.')          
         
         try:
@@ -254,10 +265,10 @@ class Dream():
                 else:
                     proposed_pts, snooker_logp_prop, z = self.generate_proposal_points(self.multitry, q0, CR, DEpair_choice, gamma_level, snooker=True)                 
                     
-            if self.last_logp == None:
+            if self.last_logp == None or self.stochastic_loglike:
                 self.last_prior, self.last_like = self.logp(q0)
                 self.last_logp = T*self.last_like + self.last_prior
-            
+
             #Evaluate logp(s)
             if self.multitry == 1:
                 q_prior, q_loglike_noT = self.logp(np.squeeze(proposed_pts)) 
@@ -363,12 +374,10 @@ class Dream():
                 with Dream_shared_vars.cross_probs.get_lock() and Dream_shared_vars.count.get_lock() and Dream_shared_vars.ncr_updates.get_lock() and Dream_shared_vars.current_positions.get_lock() and Dream_shared_vars.delta_m.get_lock():
                     #If a snooker update was run, then regardless of the originally selected CR, a CR=1.0 was used.
                     if not run_snooker:
-                        self.CR_probabilities = self.estimate_crossover_probabilities(self.total_var_dimension, q0, q_new, CR)
-
+                        self.CR_probabilities = self.estimate_crossover_probabilities(self.total_var_dimension, q0, q_new, CR) 
                     else:
                         self.CR_probabilities = self.estimate_crossover_probabilities(self.total_var_dimension, q0, q_new, CR=1)
-
-
+            
             if self.adapt_gamma and self.iter > 10 and self.iter < self.crossover_burnin and not np.any(np.array(self.gamma)==1.0) and not run_snooker:
                with Dream_shared_vars.gamma_level_probs.get_lock() and Dream_shared_vars.count.get_lock() and Dream_shared_vars.ngamma_updates.get_lock() and Dream_shared_vars.current_positions.get_lock() and Dream_shared_vars.delta_m_gamma.get_lock():
                    self.gamma_probabilities = self.estimate_gamma_level_probs(self.total_var_dimension, q0, q_new, gamma_level)
@@ -808,7 +817,7 @@ class Dream():
             
             #Orthogonal projection of chains_to_projected onto projection vector
             diff_chains_to_be_projected = [(chains_to_be_projected[point][0]-chains_to_be_projected[point][1]) for point in range(n_proposed_pts)]       
-            zP = np.nan_to_num(np.array([(np.sum(diff_chains_to_be_projected[point]*proj_vec_diff[point])/D[point] *proj_vec_diff[point]) for point in range(n_proposed_pts)]))
+            zP = np.nan_to_num(np.array([np.sum(diff_chains_to_be_projected[point]*proj_vec_diff[point])/D[point] for point in range(n_proposed_pts)]))          
             dx = self.gamma*zP
             proposed_pts = [q0 + dx[point] for point in range(n_proposed_pts)]
             norms = [np.linalg.norm(proposed_pts[point] - sampled_history_pt[point]) for point in range(n_proposed_pts)]
@@ -819,7 +828,7 @@ class Dream():
 
             #Orthogonal projection of chains_to_projected onto projection vector  
             diff_chains_to_be_projected = chains_to_be_projected[0]-chains_to_be_projected[1]
-            zP = np.nan_to_num(np.array([np.sum(np.divide((diff_chains_to_be_projected*proj_vec_diff), D, where= D != 0))]))*proj_vec_diff
+            zP = np.nan_to_num(np.array([np.sum(np.divide((diff_chains_to_be_projected*proj_vec_diff), D, where= D != 0))]))
             dx = self.gamma*zP
             proposed_pts = q0 + dx
             norm = np.linalg.norm(proposed_pts-sampled_history_pt)
@@ -846,7 +855,10 @@ class Dream():
         
         #If using multi-try and running in parallel farm out proposed points to process pool.
         if parallel:
-            p = mp.Pool(multitry)
+            if self.multiprocessing:
+                p = mp.Pool(multitry)
+            else:
+                p = WorkerPool(multitry)
             args = list(zip([self]*multitry, np.squeeze(proposed_pts)))
             logps = p.map(call_logp, args)
             p.close()
